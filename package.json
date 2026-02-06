@@ -1,0 +1,11 @@
+{
+  "name": "ralph",
+  "version": "0.1.2",
+  "private": true,
+  "bin": {
+    "ralph": "src/ralph/bin/ralph"
+  },
+  "scripts": {
+    "ralph": "bash src/ralph/bin/ralph",
+  }
+}

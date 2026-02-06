@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKDIR="$PWD"
+PROMPT_FILE="$WORKDIR/RALPH.md"
+COMPLETION_PROMISE="<promise>DONE</promise>"
+COMPLETION_EXIT_CODE="10"
+MAX_ITERATIONS="20"
+RETRY_COUNT="3"
+RETRY_SLEEP="10"
+HEARTBEAT_SECS="30"
+
+# Locate packaged helpers (resolve symlinks for bun global installs).
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  while [[ -L "$SCRIPT_PATH" ]]; do
+    link_target="$(readlink "$SCRIPT_PATH")"
+    if [[ "$link_target" == /* ]]; then
+      SCRIPT_PATH="$link_target"
+    else
+      SCRIPT_PATH="$(cd "$(dirname "$SCRIPT_PATH")" && cd "$(dirname "$link_target")" && pwd)/$(basename "$link_target")"
+    fi
+  done
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+LIB_DIR="$SCRIPT_DIR/../lib"
+
+PYTHON_BIN="$(command -v python3 || true)"
+BUN_BIN="$(command -v bun || true)"
+NODE_BIN="$(command -v node || true)"
+
+if [[ -z "$PYTHON_BIN" && -z "$BUN_BIN" && -z "$NODE_BIN" ]]; then
+  echo "ralph requires python3 or node/bun for JSONL parsing" >&2
+  exit 1
+fi
+
+if [[ ! -f "$PROMPT_FILE" ]]; then
+  echo "Prompt file not found in current directory: $PROMPT_FILE" >&2
+  exit 1
+fi
+
+# Build the prompt with a completion protocol.
+base_prompt="$(cat "$PROMPT_FILE")"
+base_prompt="${base_prompt}
+
+When the task is fully complete:
+1) Summarize changes made (files + intent).
+2) List remaining TODOs (if any), or say \"No remaining TODOs.\"
+Then output exactly: ${COMPLETION_PROMISE}
+"
+
+args=(exec --full-auto --json --skip-git-repo-check --config history.persistence="none")
+resume_args=(exec resume --last --full-auto --json --skip-git-repo-check --config history.persistence="none")
+
+# Logs + output tracking.
+LOG_DIR="$WORKDIR/.ralph"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/loop-$(date +"%Y%m%d-%H%M%S").log"
+PIPE_PGID=""
+
+cleanup() {
+  if [[ -n "${PIPE_PGID}" ]]; then
+    kill -- -"$PIPE_PGID" 2>/dev/null || true
+  fi
+}
+
+trap cleanup INT TERM
+
+# Select the JSONL parser runtime.
+if [[ -n "$PYTHON_BIN" ]]; then
+  PARSER_CMD=("$PYTHON_BIN" -u "$LIB_DIR/parse_jsonl.py")
+elif [[ -n "$BUN_BIN" ]]; then
+  PARSER_CMD=("$BUN_BIN" run --silent "$LIB_DIR/parse_jsonl.mjs")
+else
+  PARSER_CMD=("$NODE_BIN" "$LIB_DIR/parse_jsonl.mjs")
+fi
+
+# Loop until completion promise or max iterations.
+for ((i=1; i<=MAX_ITERATIONS; i++)); do
+  echo "--- Iteration $i/$MAX_ITERATIONS ---" | tee -a "$LOG_FILE"
+
+  attempt=1
+  while :; do
+    # Capture the pipeline's exit status from the backgrounded subshell.
+    status_file="$(mktemp -p /tmp ralph-status.XXXXXX)"
+
+    run_pipeline() {
+      set +e
+      # Configure the parser via env so Python/Bun stay in sync.
+      export RALPH_HEARTBEAT_SECS="$HEARTBEAT_SECS"
+      export RALPH_COMPLETION_PROMISE="$COMPLETION_PROMISE"
+      export RALPH_COMPLETION_EXIT_CODE="$COMPLETION_EXIT_CODE"
+      # Parser appends raw JSONL to the log to avoid tee buffering.
+      export RALPH_RAW_LOG_PATH="$LOG_FILE"
+      if [[ "$attempt" -gt 1 ]]; then
+        echo "Retry $attempt/$RETRY_COUNT using resume --last" | tee -a "$LOG_FILE"
+        codex "${resume_args[@]}" "$base_prompt" \
+          2>>"$LOG_FILE" | "${PARSER_CMD[@]}"
+      else
+        codex "${args[@]}" "$base_prompt" \
+          2>>"$LOG_FILE" | "${PARSER_CMD[@]}"
+      fi
+
+      pipe_status=("${PIPESTATUS[@]}")
+      # Parser is always the last stage in the pipeline.
+      if (( ${#pipe_status[@]} > 0 )); then
+        parser_status="${pipe_status[$(( ${#pipe_status[@]} - 1 ))]}"
+      else
+        parser_status=1
+      fi
+      printf '%s %s' "${pipe_status[0]}" "$parser_status" > "$status_file"
+    }
+
+    run_pipeline &
+    PIPE_PGID="$!"
+    wait "$PIPE_PGID"
+    PIPE_PGID=""
+    read -r codex_status parser_status < "$status_file" 2>/dev/null || {
+      codex_status=1
+      parser_status=1
+    }
+    rm -f "$status_file"
+
+    if [[ "${parser_status:-1}" -eq "$COMPLETION_EXIT_CODE" ]]; then
+      exit 0
+    fi
+
+    # Fallback: re-scan the log with the same parser in case streaming missed it.
+    RALPH_HEARTBEAT_SECS="$HEARTBEAT_SECS" \
+      RALPH_COMPLETION_PROMISE="$COMPLETION_PROMISE" \
+      RALPH_COMPLETION_EXIT_CODE="$COMPLETION_EXIT_CODE" \
+      "${PARSER_CMD[@]}" < "$LOG_FILE" >/dev/null 2>&1
+    log_parser_status=$?
+    if [[ "$log_parser_status" -eq "$COMPLETION_EXIT_CODE" ]]; then
+      exit 0
+    fi
+
+    if [[ $codex_status -eq 0 ]]; then
+      break
+    fi
+
+    if [[ "$attempt" -ge "$RETRY_COUNT" ]]; then
+      echo "codex exec failed after $RETRY_COUNT attempts (see $LOG_FILE)" | tee -a "$LOG_FILE"
+      exit $codex_status
+    fi
+
+    echo "codex exec failed with status $codex_status; retrying in ${RETRY_SLEEP}s" \
+      | tee -a "$LOG_FILE"
+    sleep "$RETRY_SLEEP"
+    attempt=$((attempt + 1))
+  done
+
+done
+
+echo "Max iterations reached without completion promise: $COMPLETION_PROMISE" | tee -a "$LOG_FILE"
+exit 2

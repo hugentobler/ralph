@@ -1,0 +1,11 @@
+.build/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/
+.venv*/
+.uv/
+.uv*/
+.ralph/
+RALPH.md

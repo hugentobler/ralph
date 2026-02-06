@@ -1,0 +1,16 @@
+[project]
+name = "ralph"
+version = "0.1.2"
+description = "Ralph loop CLI"
+requires-python = ">=3.12"
+
+[project.scripts]
+ralph = "ralph.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ralph"
+module-root = "src"
