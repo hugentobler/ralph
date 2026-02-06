@@ -1,6 +1,6 @@
 # ralph
 
-Run claudei (wip), codex, or pi-mono (wip) in a loop until everything in `RALPH.md` is complete.
+Run claude (wip), codex, or pi-mono (wip) in a loop until everything in `RALPH.md` is complete.
 Install with either `uv` or `bun`, then run `ralph` in any directory with a `RALPH.md` file.
 Python or JS runtime required.
 
@@ -14,4 +14,11 @@ Python or JS runtime required.
 ## Behavior
 
 - Runs for 10 max iterations until the everything in `RALPH.md` is complete.
+- Shows auto-summarized progress.
 - Logs transcript to `.ralph/loop-YYYYMMDD-HHMMSS.log`.
+
+## TODO
+- [x] Support codex.
+- [ ] Support claude.
+- [ ] Support pi-mono.
+- [ ] Support worktrees?

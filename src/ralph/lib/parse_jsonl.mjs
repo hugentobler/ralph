@@ -1,23 +1,21 @@
 import readline from "node:readline";
 
-let status = "starting...";
 let completionMessage = null;
 // Defer exit until EOF to avoid broken-pipe panics if codex keeps writing.
-const heartbeatSecs = Number.parseFloat(process.env.RALPH_HEARTBEAT_SECS ?? "30");
 const completionPromise = process.env.RALPH_COMPLETION_PROMISE ?? "<promise>DONE</promise>";
 const completionExitCode = Number.parseInt(
   process.env.RALPH_COMPLETION_EXIT_CODE ?? "10",
   10,
+);
+const runStartEpoch = Number.parseInt(process.env.RALPH_RUN_START_EPOCH ?? "0", 10) || 0;
+const finalOutputHeader = !["0", "false", "no", "off"].includes(
+  String(process.env.RALPH_FINAL_OUTPUT_HEADER ?? "1").toLowerCase(),
 );
 // Raw log receives the unbuffered stream (avoids tee delays).
 const rawLogPath = process.env.RALPH_RAW_LOG_PATH ?? null;
 const rawLogStream = rawLogPath
   ? (await import("node:fs")).createWriteStream(rawLogPath, { flags: "a" })
   : null;
-
-setInterval(() => {
-  process.stderr.write(`${status}\n`);
-}, heartbeatSecs * 1000).unref();
 
 function extractText(item) {
   const text = item?.text;
@@ -67,14 +65,7 @@ for await (const line of rl) {
   if (eventType === "item.started" || eventType === "item.updated" || eventType === "item.completed") {
     const item = obj?.item ?? {};
     const itemType = item?.item_type ?? item?.type ?? "working";
-    if (itemType === "command_execution") {
-      status = `running: ${(item?.command ?? "").trim()}`;
-    } else if (itemType === "reasoning") {
-      status = item?.text ?? "thinking...";
-    } else if (itemType === "file_change") {
-      status = "writing files";
-    } else if (itemType === "assistant_message" || itemType === "agent_message") {
-      status = "final response ready";
+    if (itemType === "assistant_message" || itemType === "agent_message") {
       if (eventType === "item.completed") {
         const extracted = extractText(item);
         if (extracted) {
@@ -84,7 +75,6 @@ for await (const line of rl) {
         }
       }
     } else if (itemType === "message" && item?.role === "assistant") {
-      status = "final response ready";
       if (eventType === "item.completed") {
         const extracted = extractText(item);
         if (extracted) {
@@ -93,20 +83,36 @@ for await (const line of rl) {
           }
         }
       }
-    } else {
-      status = itemType;
     }
   }
-}
-
-if (rawLogStream) {
-  rawLogStream.end();
 }
 
 if (completionMessage) {
   const cleaned = String(completionMessage).replace(completionPromise, "").trim();
   if (cleaned) {
+    if (finalOutputHeader) {
+      process.stderr.write("\r\u001b[2K");
+    }
+    if (finalOutputHeader && runStartEpoch) {
+      const elapsedSecs = Math.max(0, Math.floor(Date.now() / 1000) - runStartEpoch);
+      const header = `--- final output | ${Math.floor(elapsedSecs / 60)}:${String(
+        elapsedSecs % 60,
+      ).padStart(2, "0")} ---`;
+      if (rawLogStream) {
+        rawLogStream.write("\n");
+        rawLogStream.write(`${header}\n`);
+      }
+      process.stdout.write("\n");
+      process.stdout.write(`${header}\n`);
+    }
     process.stdout.write(`${cleaned}\n`);
   }
+  if (rawLogStream) {
+    rawLogStream.end();
+  }
   process.exit(completionExitCode);
+}
+
+if (rawLogStream) {
+  rawLogStream.end();
 }
