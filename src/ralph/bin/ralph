@@ -1,11 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Parse command-line arguments
+WEB_ENABLED="0"
+PROVIDER_FLAG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --web)
+      WEB_ENABLED="1"
+      shift
+      ;;
+    --codex)
+      PROVIDER_FLAG="codex"
+      shift
+      ;;
+    --claude)
+      PROVIDER_FLAG="claude"
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: ralph [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --codex   Use codex CLI"
+      echo "  --claude  Use claude CLI"
+      echo "  --web     Enable web search and fetch capabilities"
+      echo "  --help    Show this help message"
+      echo ""
+      echo "Auto-detects provider if not specified (prefers codex)."
+      echo "Requires RALPH.md in current directory."
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Use --help for usage information" >&2
+      exit 1
+      ;;
+  esac
+done
+
 WORKDIR="$PWD"
 PROMPT_FILE="$WORKDIR/RALPH.md"
 COMPLETION_PROMISE="<promise>DONE</promise>"
 COMPLETION_EXIT_CODE="10"
-MAX_ITERATIONS="20"
+MAX_ITERATIONS="8"
 RETRY_COUNT="3"
 RETRY_SLEEP="10"
 HEARTBEAT_SECS="30"
@@ -33,6 +71,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 LIB_DIR="$SCRIPT_DIR/../lib"
 
+# Source provider abstraction
+# shellcheck source=../lib/providers.sh
+source "$LIB_DIR/providers.sh"
+
 PYTHON_BIN="$(command -v python3 || true)"
 BUN_BIN="$(command -v bun || true)"
 NODE_BIN="$(command -v node || true)"
@@ -47,6 +89,24 @@ if [[ ! -f "$PROMPT_FILE" ]]; then
   exit 1
 fi
 
+# Detect and validate provider
+if [[ -n "$PROVIDER_FLAG" ]]; then
+  PROVIDER="$PROVIDER_FLAG"
+else
+  PROVIDER="$(detect_provider)"
+fi
+if [[ -z "$PROVIDER" ]]; then
+  echo "No supported AI CLI found. Install codex or claude." >&2
+  exit 1
+fi
+
+if ! validate_provider "$PROVIDER"; then
+  exit 1
+fi
+
+CLI_CMD="$(get_cli_command "$PROVIDER")"
+echo "using $PROVIDER" >&2
+
 # Build the prompt with a completion protocol.
 base_prompt="$(cat "$PROMPT_FILE")"
 base_prompt="${base_prompt}
@@ -57,9 +117,13 @@ When the task is fully complete:
 Then output exactly: ${COMPLETION_PROMISE}
 "
 
-args=(exec --full-auto --json --skip-git-repo-check --config history.persistence=none)
-resume_args=(exec resume --last --full-auto --json --skip-git-repo-check --config history.persistence=none)
-websearch_config=(--config web_search=disabled)
+# Build provider-specific arguments (as strings, not arrays, to avoid set -u issues)
+exec_args="$(build_exec_args "$PROVIDER" "$WEB_ENABLED")"
+summary_args="$(build_summary_args "$PROVIDER")"
+
+if [[ "$WEB_ENABLED" == "1" ]]; then
+  echo "Web search/fetch: enabled" >&2
+fi
 
 # Logs + output tracking.
 LOG_DIR="$WORKDIR/.ralph"
@@ -73,11 +137,22 @@ cleanup() {
     kill -- -"$PIPE_PGID" 2>/dev/null || true
   fi
   if [[ -n "${HEARTBEAT_PID}" ]]; then
-    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    # Send TERM to let the heartbeat's trap run stop_spinner gracefully
+    kill -TERM "$HEARTBEAT_PID" 2>/dev/null || true
+    # Wait briefly for clean shutdown
+    sleep 0.2
+    # Force kill any remaining children (spinner)
+    pkill -9 -P "$HEARTBEAT_PID" 2>/dev/null || true
+    # Force kill the heartbeat if still alive
+    kill -9 "$HEARTBEAT_PID" 2>/dev/null || true
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+    HEARTBEAT_PID=""
   fi
+  # Clear spinner line
+  printf '\r\033[2K' >&2
 }
 
-trap cleanup INT TERM
+trap cleanup INT TERM EXIT
 
 # Select the JSONL parser runtime.
 if [[ -n "$PYTHON_BIN" ]]; then
@@ -163,15 +238,12 @@ for ((i=1; i<=MAX_ITERATIONS; i++)); do
           else
             lines="$(tail -n "$HEARTBEAT_LINES" "$LOG_FILE" 2>/dev/null || true)"
             if [[ -n "$lines" ]]; then
-              prompt=$'Summarize the following log lines in one concise sentence of fewer than 10 words prioritising them in reverse. Be factual, no quotes, no markdown, no bullets.\n\nLOG LINES:\n'"$lines"
-              # codex exec (non-interactive) can emit multiple lines; take the final non-empty line.
-              summary="$(run_with_timeout "$SUMMARY_TIMEOUT_SECS" codex exec \
-                --full-auto \
-                --skip-git-repo-check \
-                --config history.persistence=none \
-                "${websearch_config[@]}" \
-                --config model_reasoning_effort=low \
-                "$prompt" 2>/dev/null | awk 'NF { line=$0 } END { if (line) print line }')"
+              prompt=$'Summarize the following log lines in one concise sentence of fewer than 10 words prioritising them in reverse. These are logs of a cli coding agent progress. Be factual, no quotes, no markdown, no bullets, no need to mention the agent. If there are none, say "no new log lines".\n\nLOG LINES:\n'"$lines"
+              # Use provider-specific summary command
+              # shellcheck disable=SC2086
+              summary="$(run_with_timeout "$SUMMARY_TIMEOUT_SECS" "$CLI_CMD" \
+                $summary_args \
+                "$prompt" 2>/dev/null | awk 'NF { line=$0 } END { if (line) print line }')" || true
             fi
             if [[ -n "$summary" ]]; then
               last_line_count="$line_count"
@@ -205,18 +277,17 @@ for ((i=1; i<=MAX_ITERATIONS; i++)); do
       export RALPH_FINAL_OUTPUT_HEADER="1"
       export RALPH_COMPLETION_PROMISE="$COMPLETION_PROMISE"
       export RALPH_COMPLETION_EXIT_CODE="$COMPLETION_EXIT_CODE"
+      export RALPH_PROVIDER="$PROVIDER"
       # Parser appends raw JSONL to the log to avoid tee buffering.
       export RALPH_RAW_LOG_PATH="$LOG_FILE"
       stop_heartbeat
       start_heartbeat
       if [[ "$attempt" -gt 1 ]]; then
-        echo "Retry $attempt/$RETRY_COUNT using resume --last" | tee -a "$LOG_FILE"
-        codex "${resume_args[@]}" "${websearch_config[@]}" "$base_prompt" \
-          2>>"$LOG_FILE" | "${PARSER_CMD[@]}"
-      else
-        codex "${args[@]}" "${websearch_config[@]}" "$base_prompt" \
-          2>>"$LOG_FILE" | "${PARSER_CMD[@]}"
+        echo "Retry $attempt/$RETRY_COUNT" | tee -a "$LOG_FILE"
       fi
+      # shellcheck disable=SC2086
+      "$CLI_CMD" $exec_args "$base_prompt" \
+        2>>"$LOG_FILE" | "${PARSER_CMD[@]}"
       stop_heartbeat
 
       pipe_status=("${PIPESTATUS[@]}")
@@ -233,8 +304,8 @@ for ((i=1; i<=MAX_ITERATIONS; i++)); do
     PIPE_PGID="$!"
     wait "$PIPE_PGID"
     PIPE_PGID=""
-    read -r codex_status parser_status < "$status_file" 2>/dev/null || {
-      codex_status=1
+    read -r cli_status parser_status < "$status_file" 2>/dev/null || {
+      cli_status=1
       parser_status=1
     }
     rm -f "$status_file"
@@ -247,22 +318,23 @@ for ((i=1; i<=MAX_ITERATIONS; i++)); do
     RALPH_HEARTBEAT_SECS="$HEARTBEAT_SECS" \
       RALPH_COMPLETION_PROMISE="$COMPLETION_PROMISE" \
       RALPH_COMPLETION_EXIT_CODE="$COMPLETION_EXIT_CODE" \
+      RALPH_PROVIDER="$PROVIDER" \
       "${PARSER_CMD[@]}" < "$LOG_FILE" >/dev/null 2>&1
     log_parser_status=$?
     if [[ "$log_parser_status" -eq "$COMPLETION_EXIT_CODE" ]]; then
       exit 0
     fi
 
-    if [[ $codex_status -eq 0 ]]; then
+    if [[ $cli_status -eq 0 ]]; then
       break
     fi
 
     if [[ "$attempt" -ge "$RETRY_COUNT" ]]; then
-      echo "codex exec failed after $RETRY_COUNT attempts (see $LOG_FILE)" | tee -a "$LOG_FILE"
-      exit $codex_status
+      echo "$CLI_CMD failed after $RETRY_COUNT attempts (see $LOG_FILE)" | tee -a "$LOG_FILE"
+      exit $cli_status
     fi
 
-    echo "codex exec failed with status $codex_status; retrying in ${RETRY_SLEEP}s" \
+    echo "$CLI_CMD failed with status $cli_status; retrying in ${RETRY_SLEEP}s" \
       | tee -a "$LOG_FILE"
     sleep "$RETRY_SLEEP"
     attempt=$((attempt + 1))

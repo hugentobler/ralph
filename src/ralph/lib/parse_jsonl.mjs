@@ -1,7 +1,20 @@
+/**
+ * JSONL parser for ralph - supports both Codex and Claude streaming formats.
+ *
+ * Provider detection:
+ * - RALPH_PROVIDER env var: "codex" or "claude"
+ * - Auto-detect from stream format if not specified
+ *
+ * Codex format:
+ *   {"type": "item.completed", "item": {"type": "assistant_message", "text": "..."}}
+ *
+ * Claude format:
+ *   {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}], "stop_reason": "end_turn"}}
+ */
 import readline from "node:readline";
 
 let completionMessage = null;
-// Defer exit until EOF to avoid broken-pipe panics if codex keeps writing.
+// Defer exit until EOF to avoid broken-pipe panics if CLI keeps writing.
 const completionPromise = process.env.RALPH_COMPLETION_PROMISE ?? "<promise>DONE</promise>";
 const completionExitCode = Number.parseInt(
   process.env.RALPH_COMPLETION_EXIT_CODE ?? "10",
@@ -11,13 +24,22 @@ const runStartEpoch = Number.parseInt(process.env.RALPH_RUN_START_EPOCH ?? "0", 
 const finalOutputHeader = !["0", "false", "no", "off"].includes(
   String(process.env.RALPH_FINAL_OUTPUT_HEADER ?? "1").toLowerCase(),
 );
+const configuredProvider = (process.env.RALPH_PROVIDER ?? "").toLowerCase();
+
 // Raw log receives the unbuffered stream (avoids tee delays).
 const rawLogPath = process.env.RALPH_RAW_LOG_PATH ?? null;
 const rawLogStream = rawLogPath
   ? (await import("node:fs")).createWriteStream(rawLogPath, { flags: "a" })
   : null;
 
-function extractText(item) {
+// For Claude, we accumulate text from assistant messages
+let claudeAccumulatedText = "";
+let detectedProvider = configuredProvider;
+
+/**
+ * Extract text from Codex item format.
+ */
+function extractTextCodex(item) {
   const text = item?.text;
   if (typeof text === "string" && text.trim()) return text;
   const content = item?.content;
@@ -35,9 +57,118 @@ function extractText(item) {
   return null;
 }
 
+/**
+ * Extract text from Claude CLI format.
+ * Format: {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}}
+ */
+function extractTextClaude(obj) {
+  const message = obj?.message ?? {};
+  const content = message.content;
+
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const block of content) {
+      if (block && typeof block === "object" && block.type === "text") {
+        const text = block.text ?? "";
+        if (text) {
+          parts.push(text);
+        }
+      }
+    }
+    if (parts.length) return parts.join("\n");
+  } else if (typeof content === "string") {
+    return content;
+  }
+
+  return null;
+}
+
+/**
+ * Auto-detect provider from event structure.
+ */
+function detectProviderFromEvent(obj) {
+  const eventType = obj?.type ?? "";
+
+  // Codex uses item.* event types
+  if (eventType.startsWith("item.")) {
+    return "codex";
+  }
+
+  // Claude uses "assistant", "user", "system" types with message structure
+  if (["assistant", "user", "system"].includes(eventType) && obj?.message) {
+    return "claude";
+  }
+
+  // Claude system init event
+  if (eventType === "system" && obj?.session_id) {
+    return "claude";
+  }
+
+  return "";
+}
+
+/**
+ * Record completion - keeps the LAST message containing the promise.
+ */
 function recordCompletion(text) {
-  if (!completionMessage && text) {
+  if (text) {
     completionMessage = text;
+  }
+}
+
+/**
+ * Process a Codex JSONL event.
+ */
+function processCodexEvent(obj) {
+  const eventType = obj?.type ?? "";
+  if (
+    eventType === "item.started" ||
+    eventType === "item.updated" ||
+    eventType === "item.completed"
+  ) {
+    const item = obj?.item ?? {};
+    const itemType = item?.item_type ?? item?.type ?? "working";
+    if (itemType === "assistant_message" || itemType === "agent_message") {
+      if (eventType === "item.completed") {
+        const extracted = extractTextCodex(item);
+        if (extracted && completionPromise && extracted.includes(completionPromise)) {
+          recordCompletion(extracted);
+        }
+      }
+    } else if (itemType === "message" && item?.role === "assistant") {
+      if (eventType === "item.completed") {
+        const extracted = extractTextCodex(item);
+        if (extracted && completionPromise && extracted.includes(completionPromise)) {
+          recordCompletion(extracted);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Process a Claude JSONL event.
+ * Look for assistant messages containing the completion promise.
+ */
+function processClaudeEvent(obj) {
+  const eventType = obj?.type ?? "";
+
+  // Only process assistant messages
+  if (eventType !== "assistant") {
+    return;
+  }
+
+  // Extract text from this assistant message
+  const text = extractTextClaude(obj);
+  if (text) {
+    claudeAccumulatedText += text + "\n";
+
+    // Check for completion promise
+    if (completionPromise && text.includes(completionPromise)) {
+      recordCompletion(text);
+    } else if (completionPromise && claudeAccumulatedText.includes(completionPromise)) {
+      recordCompletion(claudeAccumulatedText);
+    }
   }
 }
 
@@ -61,29 +192,17 @@ for await (const line of rl) {
     continue;
   }
 
-  const eventType = obj?.type ?? "";
-  if (eventType === "item.started" || eventType === "item.updated" || eventType === "item.completed") {
-    const item = obj?.item ?? {};
-    const itemType = item?.item_type ?? item?.type ?? "working";
-    if (itemType === "assistant_message" || itemType === "agent_message") {
-      if (eventType === "item.completed") {
-        const extracted = extractText(item);
-        if (extracted) {
-          if (completionPromise && extracted.includes(completionPromise)) {
-            recordCompletion(extracted);
-          }
-        }
-      }
-    } else if (itemType === "message" && item?.role === "assistant") {
-      if (eventType === "item.completed") {
-        const extracted = extractText(item);
-        if (extracted) {
-          if (completionPromise && extracted.includes(completionPromise)) {
-            recordCompletion(extracted);
-          }
-        }
-      }
-    }
+  // Auto-detect provider if not set
+  if (!detectedProvider) {
+    detectedProvider = detectProviderFromEvent(obj);
+  }
+
+  // Route to appropriate handler
+  if (detectedProvider === "claude") {
+    processClaudeEvent(obj);
+  } else {
+    // Default to codex format
+    processCodexEvent(obj);
   }
 }
 

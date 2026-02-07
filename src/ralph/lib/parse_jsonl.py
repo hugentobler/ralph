@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""
+JSONL parser for ralph - supports both Codex and Claude streaming formats.
+
+Provider detection:
+- RALPH_PROVIDER env var: "codex" or "claude"
+- Auto-detect from stream format if not specified
+
+Codex format:
+  {"type": "item.completed", "item": {"type": "assistant_message", "text": "..."}}
+
+Claude format:
+  {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}], "stop_reason": "end_turn"}}
+"""
 import json
 import os
 import sys
@@ -15,12 +28,17 @@ final_output_header = os.environ.get("RALPH_FINAL_OUTPUT_HEADER", "1").lower() n
     "no",
     "off",
 }
+provider = os.environ.get("RALPH_PROVIDER", "").lower()
+
 # Raw log receives the unbuffered stream (avoids tee delays).
 raw_log_path = os.environ.get("RALPH_RAW_LOG_PATH")
 raw_log_file = None
 completion_message: Optional[str] = None
 # We record completion but defer exit until EOF to avoid broken-pipe panics
-# when codex continues writing after the parser closes stdout.
+# when the CLI continues writing after the parser closes stdout.
+
+# For Claude, we accumulate text from assistant messages
+claude_accumulated_text = ""
 
 if raw_log_path:
     try:
@@ -29,7 +47,8 @@ if raw_log_path:
         raw_log_file = None
 
 
-def extract_text(item: dict[str, Any]) -> Optional[str]:
+def extract_text_codex(item: dict[str, Any]) -> Optional[str]:
+    """Extract text from Codex item format."""
     text = item.get("text")
     if isinstance(text, str) and text.strip():
         return text
@@ -47,11 +66,99 @@ def extract_text(item: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def extract_text_claude(obj: dict[str, Any]) -> Optional[str]:
+    """
+    Extract text from Claude CLI format.
+    Format: {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}}
+    """
+    message = obj.get("message", {})
+    content = message.get("content", [])
+
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+        if parts:
+            return "\n".join(parts)
+    elif isinstance(content, str):
+        return content
+
+    return None
+
+
+def detect_provider_from_event(obj: dict[str, Any]) -> str:
+    """Auto-detect provider from event structure."""
+    event_type = obj.get("type", "")
+
+    # Codex uses item.* event types
+    if event_type.startswith("item."):
+        return "codex"
+
+    # Claude uses "assistant", "user", "system" types with message structure
+    if event_type in ("assistant", "user", "system") and "message" in obj:
+        return "claude"
+
+    # Claude system init event
+    if event_type == "system" and "session_id" in obj:
+        return "claude"
+
+    return ""
+
+
 def record_completion(text: Optional[str]) -> None:
+    """Record completion - keeps the LAST message containing the promise."""
     global completion_message
-    if completion_message is None and text:
+    if text:
         completion_message = text
 
+
+def process_codex_event(obj: dict[str, Any]) -> None:
+    """Process a Codex JSONL event."""
+    event_type = obj.get("type") or ""
+    if event_type in ("item.started", "item.updated", "item.completed"):
+        item = obj.get("item", {})
+        item_type = item.get("item_type") or item.get("type") or "working"
+        if item_type in ("assistant_message", "agent_message"):
+            if event_type == "item.completed":
+                extracted = extract_text_codex(item)
+                if extracted and completion_promise in extracted:
+                    record_completion(extracted)
+        elif item_type == "message" and item.get("role") == "assistant":
+            if event_type == "item.completed":
+                extracted = extract_text_codex(item)
+                if extracted and completion_promise in extracted:
+                    record_completion(extracted)
+
+
+def process_claude_event(obj: dict[str, Any]) -> None:
+    """
+    Process a Claude JSONL event.
+    Look for assistant messages containing the completion promise.
+    """
+    global claude_accumulated_text
+
+    event_type = obj.get("type", "")
+
+    # Only process assistant messages
+    if event_type != "assistant":
+        return
+
+    # Extract text from this assistant message
+    text = extract_text_claude(obj)
+    if text:
+        claude_accumulated_text += text + "\n"
+
+        # Check for completion promise
+        if completion_promise in text:
+            record_completion(text)
+        elif completion_promise in claude_accumulated_text:
+            record_completion(claude_accumulated_text)
+
+
+detected_provider = provider
 
 try:
     for line in sys.stdin:
@@ -67,23 +174,21 @@ try:
                 record_completion(line)
             continue
 
-        event_type = obj.get("type") or ""
-        if event_type in ("item.started", "item.updated", "item.completed"):
-            item = obj.get("item", {})
-            item_type = item.get("item_type") or item.get("type") or "working"
-            if item_type in ("assistant_message", "agent_message"):
-                if event_type == "item.completed":
-                    extracted = extract_text(item)
-                    if extracted and completion_promise in extracted:
-                        record_completion(extracted)
-            elif item_type == "message" and item.get("role") == "assistant":
-                if event_type == "item.completed":
-                    extracted = extract_text(item)
-                    if extracted and completion_promise in extracted:
-                        record_completion(extracted)
+        # Auto-detect provider if not set
+        if not detected_provider:
+            detected_provider = detect_provider_from_event(obj)
+
+        # Route to appropriate handler
+        if detected_provider == "claude":
+            process_claude_event(obj)
+        else:
+            # Default to codex format
+            process_codex_event(obj)
+
 finally:
-    if completion_message:
-        cleaned = completion_message.replace(completion_promise, "").strip()
+    msg = completion_message  # local copy for type narrowing
+    if msg:
+        cleaned = msg.replace(completion_promise, "").strip()
         if cleaned:
             if final_output_header:
                 print("\r\033[2K", end="", file=sys.stderr, flush=True)
@@ -99,6 +204,4 @@ finally:
             print(cleaned, flush=True)
     if raw_log_file:
         raw_log_file.close()
-
-if completion_message:
-    raise SystemExit(completion_exit_code)
+    sys.exit(completion_exit_code if msg else 0)

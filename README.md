@@ -1,24 +1,37 @@
 # ralph
 
-Run claude (wip), codex, or pi-mono (wip) in a loop until everything in `RALPH.md` is complete.
-Install with either `uv` or `bun`, then run `ralph` in any directory with a `RALPH.md` file.
-Python or JS runtime required.
+Run codex or claude in a loop until everything in `RALPH.md` is complete.
+Auto-detects which CLI is available (prefers codex).
 
 ## Install
 
-1. Clone this repo.
-2. Install:
-    - With uv: `uv tool install {path to this repo}`
-    - With bun: `bun install -g {path to this repo}`
+```bash
+uv tool install {path to repo}
+# or
+bun install -g {path to repo}
+```
+
+Requires Python or Node/Bun for JSONL parsing.
+
+## Usage
+
+```bash
+ralph            # auto-detect provider (prefers codex)
+ralph --claude   # use claude
+ralph --codex    # use codex
+ralph --web      # enable web search/fetch
+```
 
 ## Behavior
 
-- Runs for 10 max iterations until the everything in `RALPH.md` is complete.
-- Shows auto-summarized progress.
-- Logs transcript to `.ralph/loop-YYYYMMDD-HHMMSS.log`.
+- Loops until task complete (max 8 iterations).
+- Auto-summarized progress via heartbeat.
+- Logs to `.ralph/loop-YYYYMMDD-HHMMSS.log`.
+- No session persistence - each run starts fresh.
+- Web search/fetch disabled by default.
 
 ## TODO
 - [x] Support codex.
-- [ ] Support claude.
+- [x] Support claude.
 - [ ] Support pi-mono.
 - [ ] Support worktrees?

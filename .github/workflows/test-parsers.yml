@@ -25,3 +25,6 @@ jobs:
 
       - name: Run Codex JSONL parser tests
         run: bash tests/codex_jsonl_parser.sh
+
+      - name: Run Claude JSONL parser tests
+        run: bash tests/claude_jsonl_parser.sh
