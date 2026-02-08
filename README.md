@@ -24,7 +24,7 @@ ralph --web      # enable web search/fetch
 
 ## Behavior
 
-- Loops until task complete (max 8 iterations).
+- Loops until task complete.
 - Auto-summarized progress via heartbeat.
 - Logs to `.ralph/loop-YYYYMMDD-HHMMSS.log`.
 - No session persistence - each run starts fresh.

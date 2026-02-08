@@ -43,7 +43,6 @@ WORKDIR="$PWD"
 PROMPT_FILE="$WORKDIR/RALPH.md"
 COMPLETION_PROMISE="<promise>DONE</promise>"
 COMPLETION_EXIT_CODE="10"
-MAX_ITERATIONS="8"
 RETRY_COUNT="3"
 RETRY_SLEEP="10"
 HEARTBEAT_SECS="30"
@@ -111,10 +110,23 @@ echo "using $PROVIDER" >&2
 base_prompt="$(cat "$PROMPT_FILE")"
 base_prompt="${base_prompt}
 
+Please work on the task. When you try to exit, the Ralph loop will feed the SAME PROMPT back to you for the next iteration. You'll see your previous work in files and git history, allowing you to iterate and improve.
+
+To signal completion, output EXACTLY: ${COMPLETION_PROMISE}
+
+STRICT REQUIREMENTS (DO NOT VIOLATE):
+- Use the completion promise EXACTLY as shown above
+- The task MUST be completely and unequivocally DONE
+- Do NOT output false promises to escape the loop
+- Do NOT lie even if you think you should exit
+
+IMPORTANT - Do not circumvent the loop:
+Even if you believe you're stuck, the task is impossible, or you've been running too long - you MUST NOT output a false promise. The loop is designed to continue until the task is GENUINELY COMPLETE. Trust the process. If the loop should stop, the task will be done naturally. Do not force it by lying.
+
 When the task is fully complete:
 1) Summarize changes made (files + intent).
 2) List remaining TODOs (if any), or say \"No remaining TODOs.\"
-Then output exactly: ${COMPLETION_PROMISE}
+3) Output exactly: ${COMPLETION_PROMISE}
 "
 
 # Build provider-specific arguments (as strings, not arrays, to avoid set -u issues)
@@ -163,15 +175,17 @@ else
   PARSER_CMD=("$NODE_BIN" "$LIB_DIR/parse_jsonl.mjs")
 fi
 
-# Loop until completion promise or max iterations.
-for ((i=1; i<=MAX_ITERATIONS; i++)); do
+# Loop until completion promise.
+i=0
+while true; do
+  ((i++)) || true
   if [[ "$i" -eq 1 ]]; then
-    echo "--- ralph loop $i/$MAX_ITERATIONS ---" | tee -a "$LOG_FILE"
+    echo "--- ralph loop $i ---" | tee -a "$LOG_FILE"
   else
     elapsed_secs=$(( $(date +%s) - RUN_START_EPOCH ))
     elapsed_fmt="$(printf '%d:%02d' $((elapsed_secs / 60)) $((elapsed_secs % 60)))"
     echo "" | tee -a "$LOG_FILE"
-    echo "--- ralph loop $i/$MAX_ITERATIONS | ${elapsed_fmt} ---" | tee -a "$LOG_FILE"
+    echo "--- ralph loop $i | ${elapsed_fmt} ---" | tee -a "$LOG_FILE"
   fi
 
   attempt=1
@@ -341,6 +355,3 @@ for ((i=1; i<=MAX_ITERATIONS; i++)); do
   done
 
 done
-
-echo "Max iterations reached without completion promise: $COMPLETION_PROMISE" | tee -a "$LOG_FILE"
-exit 2
