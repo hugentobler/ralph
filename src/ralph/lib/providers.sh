@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Provider abstraction layer for ralph
-# Supports: codex, claude
+# Supports: codex, claude, pi
 # Compatible with bash 3.2+ (no associative arrays)
 
 # Claude disallowed tools (blacklist approach)
@@ -10,11 +10,13 @@ CLAUDE_DISALLOWED_BASH='"Bash(curl *)" "Bash(wget *)"'
 CLAUDE_DISALLOWED_WEB='"WebFetch" "WebSearch"'
 
 detect_provider() {
-  # Auto-detect: prefer codex if available, fall back to claude
+  # Auto-detect: prefer codex if available, fall back to claude, then pi
   if command -v codex >/dev/null 2>&1; then
     echo "codex"
   elif command -v claude >/dev/null 2>&1; then
     echo "claude"
+  elif command -v pi >/dev/null 2>&1; then
+    echo "pi"
   fi
 }
 
@@ -27,15 +29,14 @@ validate_provider() {
     claude)
       command -v claude >/dev/null 2>&1 || { echo "Error: claude CLI not found" >&2; return 1; }
       ;;
+    pi)
+      command -v pi >/dev/null 2>&1 || { echo "Error: pi CLI not found" >&2; return 1; }
+      ;;
     *)
-      echo "Error: Unknown provider '$provider'. Supported: codex, claude" >&2
+      echo "Error: Unknown provider '$provider'. Supported: codex, claude, pi" >&2
       return 1
       ;;
   esac
-}
-
-get_cli_command() {
-  echo "$1"  # provider name = cli command
 }
 
 # Build execution args
@@ -58,6 +59,9 @@ build_exec_args() {
       fi
       echo "--verbose --dangerously-skip-permissions --no-session-persistence --output-format stream-json --disallowedTools $disallowed -p"
       ;;
+    pi)
+      echo "--mode json --no-session --tools read,bash,edit,write,grep,find,ls"
+      ;;
   esac
 }
 
@@ -70,6 +74,9 @@ build_summary_args() {
     claude)
       # Use haiku for fast/cheap summaries, no tools needed
       echo "--model haiku --no-session-persistence --output-format text --tools \"\" -p"
+      ;;
+    pi)
+      echo "--print --no-session --no-tools --thinking low"
       ;;
   esac
 }

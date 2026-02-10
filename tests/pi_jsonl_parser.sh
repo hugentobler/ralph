@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for parsing Codex JSONL event streams in both Python and Bun parsers.
+# Tests for parsing pi JSON event streams in both Python and Bun parsers.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,7 +32,7 @@ run_parser_suite() {
         RALPH_COMPLETION_PROMISE="<promise>DONE</promise>" \
         RALPH_COMPLETION_EXIT_CODE="10" \
         RALPH_RAW_LOG_PATH="$raw_log" \
-        RALPH_PROVIDER="codex" \
+        RALPH_PROVIDER="pi" \
         "${parser_cmd[@]}" >"$tmp_out" 2>/dev/null
     local status=$?
     set -e
@@ -71,7 +71,7 @@ run_parser_suite() {
         RALPH_COMPLETION_PROMISE="<promise>DONE</promise>" \
         RALPH_COMPLETION_EXIT_CODE="10" \
         RALPH_RAW_LOG_PATH="$raw_log" \
-        RALPH_PROVIDER="codex" \
+        RALPH_PROVIDER="pi" \
         "${parser_cmd[@]}" >/dev/null 2>/dev/null
     local status=$?
     set -e
@@ -93,21 +93,33 @@ run_parser_suite() {
   }
 
   run_one "json_completion" 10 "hello" \
-    '{"type":"item.completed","item":{"type":"agent_message","text":"hello <promise>DONE</promise>"}}'
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello <promise>DONE</promise>"}]}}'
 
   run_one "non_json_completion" 10 "noise" \
     'noise <promise>DONE</promise>'
 
-  run_one "command_output_contains_promise" 0 "" \
-    '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"<promise>DONE</promise>"}}'
+  run_one "user_message_with_promise" 0 "" \
+    '{"type":"message_end","message":{"role":"user","content":"<promise>DONE</promise>"}}'
 
-  run_one "completion_then_more" 10 "hello" \
-    '{"type":"item.completed","item":{"type":"agent_message","text":"hello <promise>DONE</promise>"}}' \
-    '{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"later"}}'
+  run_one "multiple_messages_last_wins" 10 "final message" \
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"first <promise>DONE</promise>"}]}}' \
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"final message <promise>DONE</promise>"}]}}'
 
-  run_raw_log_check "skip_item_updated" 10 "item.updated" "item.completed" \
-    '{"type":"item.updated","item":{"type":"agent_message","text":"partial"}}' \
-    '{"type":"item.completed","item":{"type":"agent_message","text":"final <promise>DONE</promise>"}}'
+  run_one "multiple_content_blocks" 10 "hello
+world" \
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello"},{"type":"text","text":"world <promise>DONE</promise>"}]}}'
+
+  run_one "mixed_content_with_thinking" 10 "done" \
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"toolCall","id":"t1","name":"tool","arguments":{}},{"type":"text","text":"done <promise>DONE</promise>"}]}}'
+
+  run_raw_log_check "skip_message_update" 10 "message_update" "message_end" \
+    '{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"partial"}]}}' \
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"final <promise>DONE</promise>"}]}}'
+
+  run_raw_log_check "skip_tool_execution_update" 10 "tool_execution_update" "tool_execution_end" \
+    '{"type":"tool_execution_update","toolCallId":"t1","toolName":"bash","partialResult":"chunk"}' \
+    '{"type":"tool_execution_end","toolCallId":"t1","toolName":"bash","result":"ok"}' \
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"final <promise>DONE</promise>"}]}}'
 
   if [[ "$failures" -ne 0 ]]; then
     exit 1
@@ -126,4 +138,4 @@ else
   echo "bun not found; skipping bun parser tests" >&2
 fi
 
-echo "codex jsonl parser tests: ok"
+echo "pi jsonl parser tests: ok"

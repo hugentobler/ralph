@@ -18,13 +18,18 @@ while [[ $# -gt 0 ]]; do
       PROVIDER_FLAG="claude"
       shift
       ;;
+    --pi)
+      PROVIDER_FLAG="pi"
+      shift
+      ;;
     --help|-h)
       echo "Usage: ralph [OPTIONS]"
       echo ""
       echo "Options:"
       echo "  --codex   Use codex CLI"
       echo "  --claude  Use claude CLI"
-      echo "  --web     Enable web search and fetch capabilities"
+      echo "  --pi      Use pi coding agent CLI"
+      echo "  --web     Enable web search and fetch (codex/claude only)"
       echo "  --help    Show this help message"
       echo ""
       echo "Auto-detects provider if not specified (prefers codex)."
@@ -95,7 +100,7 @@ else
   PROVIDER="$(detect_provider)"
 fi
 if [[ -z "$PROVIDER" ]]; then
-  echo "No supported AI CLI found. Install codex or claude." >&2
+  echo "No supported AI CLI found. Install codex, claude, or pi." >&2
   exit 1
 fi
 
@@ -103,7 +108,7 @@ if ! validate_provider "$PROVIDER"; then
   exit 1
 fi
 
-CLI_CMD="$(get_cli_command "$PROVIDER")"
+CLI_CMD="$PROVIDER"
 echo "using $PROVIDER" >&2
 
 # Build the prompt with a completion protocol.
@@ -134,7 +139,11 @@ exec_args="$(build_exec_args "$PROVIDER" "$WEB_ENABLED")"
 summary_args="$(build_summary_args "$PROVIDER")"
 
 if [[ "$WEB_ENABLED" == "1" ]]; then
-  echo "Web search/fetch: enabled" >&2
+  if [[ "$PROVIDER" == "pi" ]]; then
+    echo "Web search/fetch: enabled (ignored for pi)" >&2
+  else
+    echo "Web search/fetch: enabled" >&2
+  fi
 fi
 
 # Logs + output tracking.

@@ -1,6 +1,6 @@
 # ralph
 
-Run codex or claude in a loop until everything in `RALPH.md` is complete.
+Run codex, claude, or pi in a loop until everything in `RALPH.md` is complete.
 Auto-detects which CLI is available (prefers codex).
 
 ## Install
@@ -19,8 +19,11 @@ Requires Python or Node/Bun for JSONL parsing.
 ralph            # auto-detect provider (prefers codex)
 ralph --claude   # use claude
 ralph --codex    # use codex
-ralph --web      # enable web search/fetch
+ralph --pi       # use pi
+ralph --web      # enable web search/fetch (codex/claude only)
 ```
+
+Copy `RALPH.example.md` to `RALPH.md` and describe the task before running.
 
 ## Behavior
 
@@ -28,10 +31,11 @@ ralph --web      # enable web search/fetch
 - Auto-summarized progress via heartbeat.
 - Logs to `.ralph/loop-YYYYMMDD-HHMMSS.log`.
 - No session persistence - each run starts fresh.
-- Web search/fetch disabled by default.
+- Web search/fetch disabled by default (codex/claude only; pi ignores --web).
 
 ## TODO
 - [x] Support codex.
 - [x] Support claude.
-- [ ] Support pi-mono.
+- [x] Support pi.
+- [ ] Cleanup JSONL parsing.
 - [ ] Support worktrees?

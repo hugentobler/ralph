@@ -28,3 +28,6 @@ jobs:
 
       - name: Run Claude JSONL parser tests
         run: bash tests/claude_jsonl_parser.sh
+
+      - name: Run Pi JSONL parser tests
+        run: bash tests/pi_jsonl_parser.sh

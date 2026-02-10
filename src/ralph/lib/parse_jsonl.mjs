@@ -1,15 +1,17 @@
 /**
- * JSONL parser for ralph - supports both Codex and Claude streaming formats.
+ * JSONL parser for ralph - supports Codex, Claude, and pi streaming formats.
  *
- * Provider detection:
- * - RALPH_PROVIDER env var: "codex" or "claude"
- * - Auto-detect from stream format if not specified
+ * Provider:
+ * - RALPH_PROVIDER env var: "codex", "claude", or "pi"
  *
  * Codex format:
  *   {"type": "item.completed", "item": {"type": "assistant_message", "text": "..."}}
  *
  * Claude format:
  *   {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}], "stop_reason": "end_turn"}}
+ *
+ * Pi format (pi --mode json):
+ *   {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "..."}]}}
  */
 import readline from "node:readline";
 
@@ -24,17 +26,54 @@ const runStartEpoch = Number.parseInt(process.env.RALPH_RUN_START_EPOCH ?? "0", 
 const finalOutputHeader = !["0", "false", "no", "off"].includes(
   String(process.env.RALPH_FINAL_OUTPUT_HEADER ?? "1").toLowerCase(),
 );
-const configuredProvider = (process.env.RALPH_PROVIDER ?? "").toLowerCase();
+const provider = (process.env.RALPH_PROVIDER ?? "").toLowerCase();
+
+const TEXT_BLOCK_TYPES = new Set(["text"]);
+const EMPTY_SKIP_SET = new Set();
 
 // Raw log receives the unbuffered stream (avoids tee delays).
 const rawLogPath = process.env.RALPH_RAW_LOG_PATH ?? null;
-const rawLogStream = rawLogPath
-  ? (await import("node:fs")).createWriteStream(rawLogPath, { flags: "a" })
-  : null;
+const fs = await import("node:fs");
+const rawLogStream = rawLogPath ? fs.createWriteStream(rawLogPath, { flags: "a" }) : null;
 
-// For Claude, we accumulate text from assistant messages
-let claudeAccumulatedText = "";
-let detectedProvider = configuredProvider;
+/**
+ * Extract text from content blocks or strings.
+ */
+function extractTextFromBlocks(
+  content,
+  { allowedTypes = null, textKeys = ["text", "content"] } = {},
+) {
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      if (allowedTypes && !allowedTypes.has(block.type)) continue;
+      let blockText = null;
+      for (const key of textKeys) {
+        const value = block[key];
+        if (typeof value === "string" && value.trim()) {
+          blockText = value;
+          break;
+        }
+      }
+      if (blockText) parts.push(blockText);
+    }
+    if (parts.length) return parts.join("\n");
+  } else if (typeof content === "string") {
+    return content;
+  }
+  return null;
+}
+
+function extractTextFromMessage(message, { requireRole = null } = {}) {
+  if (requireRole && message?.role !== requireRole) {
+    return null;
+  }
+  return extractTextFromBlocks(message?.content, {
+    allowedTypes: TEXT_BLOCK_TYPES,
+    textKeys: ["text"],
+  });
+}
 
 /**
  * Extract text from Codex item format.
@@ -42,19 +81,10 @@ let detectedProvider = configuredProvider;
 function extractTextCodex(item) {
   const text = item?.text;
   if (typeof text === "string" && text.trim()) return text;
-  const content = item?.content;
-  if (Array.isArray(content)) {
-    const parts = [];
-    for (const block of content) {
-      if (!block || typeof block !== "object") continue;
-      const blockText = block.text ?? block.content;
-      if (typeof blockText === "string" && blockText.trim()) {
-        parts.push(blockText);
-      }
-    }
-    if (parts.length) return parts.join("\n");
-  }
-  return null;
+  return extractTextFromBlocks(item?.content, {
+    allowedTypes: null,
+    textKeys: ["text", "content"],
+  });
 }
 
 /**
@@ -63,48 +93,19 @@ function extractTextCodex(item) {
  */
 function extractTextClaude(obj) {
   const message = obj?.message ?? {};
-  const content = message.content;
-
-  if (Array.isArray(content)) {
-    const parts = [];
-    for (const block of content) {
-      if (block && typeof block === "object" && block.type === "text") {
-        const text = block.text ?? "";
-        if (text) {
-          parts.push(text);
-        }
-      }
-    }
-    if (parts.length) return parts.join("\n");
-  } else if (typeof content === "string") {
-    return content;
-  }
-
-  return null;
+  return extractTextFromMessage(message);
 }
 
-/**
- * Auto-detect provider from event structure.
- */
-function detectProviderFromEvent(obj) {
-  const eventType = obj?.type ?? "";
+function extractTextPiMessage(message) {
+  return extractTextFromMessage(message, { requireRole: "assistant" });
+}
 
-  // Codex uses item.* event types
-  if (eventType.startsWith("item.")) {
-    return "codex";
+function isCodexAssistantItem(item) {
+  const itemType = item?.item_type ?? item?.type ?? "";
+  if (itemType === "assistant_message" || itemType === "agent_message") {
+    return true;
   }
-
-  // Claude uses "assistant", "user", "system" types with message structure
-  if (["assistant", "user", "system"].includes(eventType) && obj?.message) {
-    return "claude";
-  }
-
-  // Claude system init event
-  if (eventType === "system" && obj?.session_id) {
-    return "claude";
-  }
-
-  return "";
+  return itemType === "message" && item?.role === "assistant";
 }
 
 /**
@@ -116,59 +117,57 @@ function recordCompletion(text) {
   }
 }
 
-/**
- * Process a Codex JSONL event.
- */
-function processCodexEvent(obj) {
-  const eventType = obj?.type ?? "";
-  if (
-    eventType === "item.started" ||
-    eventType === "item.updated" ||
-    eventType === "item.completed"
+const PROVIDERS = {
+  codex: {
+    skipEventTypes: new Set(["item.updated"]),
+    accumulateText: false,
+    extractText(obj) {
+      if (obj?.type !== "item.completed") return null;
+      const item = obj?.item ?? {};
+      if (!isCodexAssistantItem(item)) return null;
+      return extractTextCodex(item);
+    },
+  },
+  claude: {
+    skipEventTypes: new Set(),
+    accumulateText: true,
+    extractText(obj) {
+      if (obj?.type !== "assistant") return null;
+      return extractTextClaude(obj);
+    },
+  },
+  pi: {
+    skipEventTypes: new Set(["message_update", "tool_execution_update"]),
+    accumulateText: false,
+    extractText(obj) {
+      if (obj?.type !== "message_end") return null;
+      return extractTextPiMessage(obj?.message ?? {});
+    },
+  },
+};
+
+const providerConfig = PROVIDERS[provider] ?? {
+  skipEventTypes: EMPTY_SKIP_SET,
+  accumulateText: false,
+  extractText: () => null,
+};
+const providerState = {
+  accumulatedText: "",
+};
+
+function handleExtractedText(text) {
+  if (!text) return;
+  if (providerConfig.accumulateText) {
+    providerState.accumulatedText += `${text}\n`;
+  }
+  if (completionPromise && text.includes(completionPromise)) {
+    recordCompletion(text);
+  } else if (
+    providerConfig.accumulateText &&
+    completionPromise &&
+    providerState.accumulatedText.includes(completionPromise)
   ) {
-    const item = obj?.item ?? {};
-    const itemType = item?.item_type ?? item?.type ?? "working";
-    if (itemType === "assistant_message" || itemType === "agent_message") {
-      if (eventType === "item.completed") {
-        const extracted = extractTextCodex(item);
-        if (extracted && completionPromise && extracted.includes(completionPromise)) {
-          recordCompletion(extracted);
-        }
-      }
-    } else if (itemType === "message" && item?.role === "assistant") {
-      if (eventType === "item.completed") {
-        const extracted = extractTextCodex(item);
-        if (extracted && completionPromise && extracted.includes(completionPromise)) {
-          recordCompletion(extracted);
-        }
-      }
-    }
-  }
-}
-
-/**
- * Process a Claude JSONL event.
- * Look for assistant messages containing the completion promise.
- */
-function processClaudeEvent(obj) {
-  const eventType = obj?.type ?? "";
-
-  // Only process assistant messages
-  if (eventType !== "assistant") {
-    return;
-  }
-
-  // Extract text from this assistant message
-  const text = extractTextClaude(obj);
-  if (text) {
-    claudeAccumulatedText += text + "\n";
-
-    // Check for completion promise
-    if (completionPromise && text.includes(completionPromise)) {
-      recordCompletion(text);
-    } else if (completionPromise && claudeAccumulatedText.includes(completionPromise)) {
-      recordCompletion(claudeAccumulatedText);
-    }
+    recordCompletion(providerState.accumulatedText);
   }
 }
 
@@ -178,13 +177,13 @@ const rl = readline.createInterface({
 });
 
 for await (const line of rl) {
-  if (rawLogStream) {
-    rawLogStream.write(`${line}\n`);
-  }
   let obj;
   try {
     obj = JSON.parse(line);
   } catch {
+    if (rawLogStream) {
+      rawLogStream.write(`${line}\n`);
+    }
     // Fast-path in case the stream isn't JSONL.
     if (completionPromise && line.includes(completionPromise) && !completionMessage) {
       recordCompletion(line);
@@ -192,18 +191,16 @@ for await (const line of rl) {
     continue;
   }
 
-  // Auto-detect provider if not set
-  if (!detectedProvider) {
-    detectedProvider = detectProviderFromEvent(obj);
+  if (rawLogStream) {
+    const eventType = obj?.type ?? "";
+    const skipSet = providerConfig.skipEventTypes ?? EMPTY_SKIP_SET;
+    if (!skipSet.has(eventType)) {
+      rawLogStream.write(`${line}\n`);
+    }
   }
 
-  // Route to appropriate handler
-  if (detectedProvider === "claude") {
-    processClaudeEvent(obj);
-  } else {
-    // Default to codex format
-    processCodexEvent(obj);
-  }
+  const extracted = providerConfig.extractText(obj);
+  handleExtractedText(extracted);
 }
 
 if (completionMessage) {

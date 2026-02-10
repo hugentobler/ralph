@@ -6,6 +6,6 @@
     "ralph": "src/ralph/bin/ralph"
   },
   "scripts": {
-    "ralph": "bash src/ralph/bin/ralph",
+    "ralph": "bash src/ralph/bin/ralph"
   }
 }

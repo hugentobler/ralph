@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-JSONL parser for ralph - supports both Codex and Claude streaming formats.
+JSONL parser for ralph - supports Codex, Claude, and pi streaming formats.
 
-Provider detection:
-- RALPH_PROVIDER env var: "codex" or "claude"
-- Auto-detect from stream format if not specified
+Provider:
+- RALPH_PROVIDER env var: "codex", "claude", or "pi"
 
 Codex format:
   {"type": "item.completed", "item": {"type": "assistant_message", "text": "..."}}
 
 Claude format:
   {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}], "stop_reason": "end_turn"}}
+
+Pi format (pi --mode json):
+  {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "..."}]}}
 """
 import json
 import os
@@ -30,15 +32,15 @@ final_output_header = os.environ.get("RALPH_FINAL_OUTPUT_HEADER", "1").lower() n
 }
 provider = os.environ.get("RALPH_PROVIDER", "").lower()
 
+TEXT_BLOCK_TYPES = {"text"}
+
 # Raw log receives the unbuffered stream (avoids tee delays).
 raw_log_path = os.environ.get("RALPH_RAW_LOG_PATH")
 raw_log_file = None
 completion_message: Optional[str] = None
+
 # We record completion but defer exit until EOF to avoid broken-pipe panics
 # when the CLI continues writing after the parser closes stdout.
-
-# For Claude, we accumulate text from assistant messages
-claude_accumulated_text = ""
 
 if raw_log_path:
     try:
@@ -47,40 +49,28 @@ if raw_log_path:
         raw_log_file = None
 
 
-def extract_text_codex(item: dict[str, Any]) -> Optional[str]:
-    """Extract text from Codex item format."""
-    text = item.get("text")
-    if isinstance(text, str) and text.strip():
-        return text
-    content = item.get("content")
+def extract_text_from_blocks(
+    content: Any,
+    *,
+    allowed_types: Optional[set[str]] = None,
+    text_keys: tuple[str, ...] = ("text", "content"),
+) -> Optional[str]:
+    """Extract text from content blocks or strings."""
     if isinstance(content, list):
         parts: list[str] = []
         for block in content:
             if not isinstance(block, dict):
                 continue
-            block_text = block.get("text") or block.get("content")
-            if isinstance(block_text, str) and block_text.strip():
+            if allowed_types is not None and block.get("type") not in allowed_types:
+                continue
+            block_text = None
+            for key in text_keys:
+                value = block.get(key)
+                if isinstance(value, str) and value.strip():
+                    block_text = value
+                    break
+            if block_text:
                 parts.append(block_text)
-        if parts:
-            return "\n".join(parts)
-    return None
-
-
-def extract_text_claude(obj: dict[str, Any]) -> Optional[str]:
-    """
-    Extract text from Claude CLI format.
-    Format: {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}}
-    """
-    message = obj.get("message", {})
-    content = message.get("content", [])
-
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-                if text:
-                    parts.append(text)
         if parts:
             return "\n".join(parts)
     elif isinstance(content, str):
@@ -89,23 +79,46 @@ def extract_text_claude(obj: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def detect_provider_from_event(obj: dict[str, Any]) -> str:
-    """Auto-detect provider from event structure."""
-    event_type = obj.get("type", "")
+def extract_text_from_message(
+    message: dict[str, Any], *, require_role: Optional[str] = None
+) -> Optional[str]:
+    """Extract text from a message with optional role filtering."""
+    if require_role and message.get("role") != require_role:
+        return None
+    return extract_text_from_blocks(
+        message.get("content"),
+        allowed_types=TEXT_BLOCK_TYPES,
+        text_keys=("text",),
+    )
 
-    # Codex uses item.* event types
-    if event_type.startswith("item."):
-        return "codex"
 
-    # Claude uses "assistant", "user", "system" types with message structure
-    if event_type in ("assistant", "user", "system") and "message" in obj:
-        return "claude"
+def extract_text_codex(item: dict[str, Any]) -> Optional[str]:
+    """Extract text from Codex item format."""
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    return extract_text_from_blocks(item.get("content"), allowed_types=None)
 
-    # Claude system init event
-    if event_type == "system" and "session_id" in obj:
-        return "claude"
 
-    return ""
+def extract_text_claude(obj: dict[str, Any]) -> Optional[str]:
+    """
+    Extract text from Claude CLI format.
+    Format: {"type": "assistant", "message": {"content": [{"type": "text", "text": "..."}]}}
+    """
+    message = obj.get("message", {})
+    return extract_text_from_message(message)
+
+
+def extract_text_pi_message(message: dict[str, Any]) -> Optional[str]:
+    """Extract text from a pi assistant message."""
+    return extract_text_from_message(message, require_role="assistant")
+
+
+def is_codex_assistant_item(item: dict[str, Any]) -> bool:
+    item_type = item.get("item_type") or item.get("type") or ""
+    if item_type in {"assistant_message", "agent_message"}:
+        return True
+    return item_type == "message" and item.get("role") == "assistant"
 
 
 def record_completion(text: Optional[str]) -> None:
@@ -115,58 +128,80 @@ def record_completion(text: Optional[str]) -> None:
         completion_message = text
 
 
-def process_codex_event(obj: dict[str, Any]) -> None:
-    """Process a Codex JSONL event."""
-    event_type = obj.get("type") or ""
-    if event_type in ("item.started", "item.updated", "item.completed"):
-        item = obj.get("item", {})
-        item_type = item.get("item_type") or item.get("type") or "working"
-        if item_type in ("assistant_message", "agent_message"):
-            if event_type == "item.completed":
-                extracted = extract_text_codex(item)
-                if extracted and completion_promise in extracted:
-                    record_completion(extracted)
-        elif item_type == "message" and item.get("role") == "assistant":
-            if event_type == "item.completed":
-                extracted = extract_text_codex(item)
-                if extracted and completion_promise in extracted:
-                    record_completion(extracted)
+def extract_codex_event_text(obj: dict[str, Any]) -> Optional[str]:
+    """Extract completion text from Codex JSONL events."""
+    if obj.get("type") != "item.completed":
+        return None
+    item = obj.get("item", {})
+    if not is_codex_assistant_item(item):
+        return None
+    return extract_text_codex(item)
 
 
-def process_claude_event(obj: dict[str, Any]) -> None:
-    """
-    Process a Claude JSONL event.
-    Look for assistant messages containing the completion promise.
-    """
-    global claude_accumulated_text
+def extract_claude_event_text(obj: dict[str, Any]) -> Optional[str]:
+    """Extract completion text from Claude JSONL events."""
+    if obj.get("type") != "assistant":
+        return None
+    return extract_text_claude(obj)
 
-    event_type = obj.get("type", "")
 
-    # Only process assistant messages
-    if event_type != "assistant":
+def extract_pi_event_text(obj: dict[str, Any]) -> Optional[str]:
+    """Extract completion text from pi JSON events."""
+    if obj.get("type") != "message_end":
+        return None
+    return extract_text_pi_message(obj.get("message", {}))
+
+
+def extract_nothing(_: dict[str, Any]) -> Optional[str]:
+    return None
+
+
+PROVIDERS: dict[str, dict[str, Any]] = {
+    "codex": {
+        "skip_event_types": {"item.updated"},
+        "accumulate_text": False,
+        "extract_text": extract_codex_event_text,
+    },
+    "claude": {
+        "skip_event_types": set(),
+        "accumulate_text": True,
+        "extract_text": extract_claude_event_text,
+    },
+    "pi": {
+        "skip_event_types": {"message_update", "tool_execution_update"},
+        "accumulate_text": False,
+        "extract_text": extract_pi_event_text,
+    },
+}
+DEFAULT_PROVIDER = {
+    "skip_event_types": set(),
+    "accumulate_text": False,
+    "extract_text": extract_nothing,
+}
+provider_config = PROVIDERS.get(provider, DEFAULT_PROVIDER)
+provider_state = {
+    "accumulated_text": "",
+}
+
+
+def handle_extracted_text(extracted: Optional[str]) -> None:
+    if not extracted:
         return
+    if provider_config["accumulate_text"]:
+        provider_state["accumulated_text"] += extracted + "\n"
+    if completion_promise and completion_promise in extracted:
+        record_completion(extracted)
+    elif provider_config["accumulate_text"] and completion_promise in provider_state["accumulated_text"]:
+        record_completion(provider_state["accumulated_text"])
 
-    # Extract text from this assistant message
-    text = extract_text_claude(obj)
-    if text:
-        claude_accumulated_text += text + "\n"
-
-        # Check for completion promise
-        if completion_promise in text:
-            record_completion(text)
-        elif completion_promise in claude_accumulated_text:
-            record_completion(claude_accumulated_text)
-
-
-detected_provider = provider
 
 try:
     for line in sys.stdin:
-        if raw_log_file:
-            raw_log_file.write(line)
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
+            if raw_log_file:
+                raw_log_file.write(line)
             # Fast-path in case the stream isn't JSONL.
             if completion_promise and completion_promise in line and completion_message is None:
                 if raw_log_file:
@@ -174,16 +209,13 @@ try:
                 record_completion(line)
             continue
 
-        # Auto-detect provider if not set
-        if not detected_provider:
-            detected_provider = detect_provider_from_event(obj)
+        if raw_log_file:
+            event_type = obj.get("type", "")
+            if event_type not in provider_config["skip_event_types"]:
+                raw_log_file.write(line)
 
-        # Route to appropriate handler
-        if detected_provider == "claude":
-            process_claude_event(obj)
-        else:
-            # Default to codex format
-            process_codex_event(obj)
+        extracted = provider_config["extract_text"](obj)
+        handle_extracted_text(extracted)
 
 finally:
     msg = completion_message  # local copy for type narrowing
